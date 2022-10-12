@@ -32,6 +32,22 @@ jobs:
         run: |
           echo "${HOME}/bin/" >> $GITHUB_PATH # default INSTALL_DIR to path
           scripts/dev_setup.sh -b -i awscli # install individual tool awscli in batch mode
+      - name: Build replay-verify CLI in release mode
+        run: cargo build --release -p backup-cli --bin replay-verify --bin db-backup
+      - name: query latest version in backup, at the same time, pre-heat metadata cache
+        run: |
+          target/release/db-backup one-shot query backup-storage-state \
+          --metadata-cache-dir ./metadata-cache \
+          command-adapter --config terraform/helm/fullnode/files/backup/s3-public.yaml
       - name: Run replay-verify against public backup bucket
         timeout-minutes: 720
-        run: cargo run -r --bin replay-verify -- --ledger-db-max-total-wal-size 80530636800 --state-merkle-db-max-total-wal-size 80530636800 --index-db-max-total-wal-size 80530636800 --target-db-dir /tmp/db command-adapter --config terraform/helm/fullnode/files/backup/s3-public.yaml
+        run: |
+          mkdir run1 && \
+          cp -r metadata-cache run1/ && \
+          target/release/replay-verify \
+          --concurrent-downloads 1 \
+          --replay-concurrency-level 1 \
+          --metadata-cache-dir ./run1/metadata-cache \
+          --target-db-dir ./run1/metadata-cache \
+          --start-version 142000000 \
+          command-adapter --config terraform/helm/fullnode/files/backup/s3-public.yaml
