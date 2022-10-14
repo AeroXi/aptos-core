@@ -33,6 +33,7 @@ use async_trait::async_trait;
 use clap::{ArgEnum, Parser};
 use hex::FromHexError;
 use move_deps::move_core_types::account_address::AccountAddress;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 #[cfg(unix)]
@@ -443,6 +444,51 @@ pub enum EncodingType {
 }
 
 impl EncodingType {
+    pub fn encode_file<Input: Serialize>(
+        &self,
+        name: &'static str,
+        input: &Input,
+        path: &Path,
+    ) -> CliTypedResult<()> {
+        let bytes = self.encode(name, input)?;
+        write_to_user_only_file(path, name, &bytes)
+    }
+
+    pub fn decode_file<Output: DeserializeOwned>(
+        &self,
+        name: &'static str,
+        path: &Path,
+    ) -> CliTypedResult<Output> {
+        let bytes = read_from_file(path)?;
+        self.decode(name, bytes)
+    }
+
+    pub fn encode<Input: Serialize>(
+        &self,
+        name: &'static str,
+        input: &Input,
+    ) -> CliTypedResult<Vec<u8>> {
+        let bytes = bcs::to_bytes(input).map_err(|err| CliError::BCS(name, err))?;
+        Ok(match self {
+            EncodingType::BCS => bytes,
+            EncodingType::Hex => hex::encode_upper(bytes).into_bytes(),
+            EncodingType::Base64 => base64::encode(bytes).into_bytes(),
+        })
+    }
+
+    pub fn decode<Output: DeserializeOwned>(
+        &self,
+        name: &'static str,
+        input: Vec<u8>,
+    ) -> CliTypedResult<Output> {
+        let bytes = match self {
+            EncodingType::BCS => input,
+            EncodingType::Hex => hex::decode(String::from_utf8(input)?)?,
+            EncodingType::Base64 => base64::decode(String::from_utf8(input)?)?,
+        };
+        bcs::from_bytes(&bytes).map_err(|err| CliError::BCS(name, err))
+    }
+
     /// Encodes `Key` into one of the `EncodingType`s
     pub fn encode_key<Key: ValidCryptoMaterial>(
         &self,
@@ -1063,6 +1109,43 @@ pub struct TransactionSummary {
     pub version: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_transaction_path: Option<PathBuf>,
+}
+
+impl From<(HashValue, &Path)> for TransactionSummary {
+    fn from((txn_hash, path): (HashValue, &Path)) -> Self {
+        TransactionSummary {
+            saved_transaction_path: Some(path.to_path_buf()),
+            transaction_hash: txn_hash,
+            gas_used: None,
+            gas_unit_price: None,
+            pending: None,
+            sender: None,
+            sequence_number: None,
+            success: None,
+            timestamp_us: None,
+            version: None,
+            vm_status: None,
+        }
+    }
+}
+
+impl From<TransactionOutput> for TransactionSummary {
+    fn from(output: TransactionOutput) -> Self {
+        TransactionSummary::from(&output)
+    }
+}
+
+impl From<&TransactionOutput> for TransactionSummary {
+    fn from(output: &TransactionOutput) -> Self {
+        match output {
+            TransactionOutput::Txn(txn) => TransactionSummary::from(txn),
+            TransactionOutput::SavedTxn(hash, file) => {
+                TransactionSummary::from((*hash, file.as_path()))
+            }
+        }
+    }
 }
 
 impl From<Transaction> for TransactionSummary {
@@ -1070,6 +1153,7 @@ impl From<Transaction> for TransactionSummary {
         TransactionSummary::from(&transaction)
     }
 }
+
 impl From<&Transaction> for TransactionSummary {
     fn from(transaction: &Transaction) -> Self {
         match transaction {
@@ -1084,6 +1168,7 @@ impl From<&Transaction> for TransactionSummary {
                 version: None,
                 vm_status: None,
                 timestamp_us: None,
+                saved_transaction_path: None,
             },
             Transaction::UserTransaction(txn) => TransactionSummary {
                 transaction_hash: txn.info.hash,
@@ -1096,6 +1181,7 @@ impl From<&Transaction> for TransactionSummary {
                 sequence_number: Some(txn.request.sequence_number.0),
                 timestamp_us: Some(txn.timestamp.0),
                 pending: None,
+                saved_transaction_path: None,
             },
             Transaction::GenesisTransaction(txn) => TransactionSummary {
                 transaction_hash: txn.info.hash,
@@ -1108,6 +1194,7 @@ impl From<&Transaction> for TransactionSummary {
                 pending: None,
                 sequence_number: None,
                 timestamp_us: None,
+                saved_transaction_path: None,
             },
             Transaction::BlockMetadataTransaction(txn) => TransactionSummary {
                 transaction_hash: txn.info.hash,
@@ -1120,6 +1207,7 @@ impl From<&Transaction> for TransactionSummary {
                 gas_unit_price: None,
                 pending: None,
                 sequence_number: None,
+                saved_transaction_path: None,
             },
             Transaction::StateCheckpointTransaction(txn) => TransactionSummary {
                 transaction_hash: txn.info.hash,
@@ -1132,6 +1220,7 @@ impl From<&Transaction> for TransactionSummary {
                 gas_unit_price: None,
                 pending: None,
                 sequence_number: None,
+                saved_transaction_path: None,
             },
         }
     }
@@ -1220,15 +1309,12 @@ pub struct GasOptions {
 /// Common options for interacting with an account for a validator
 #[derive(Debug, Default, Parser)]
 pub struct TransactionOptions {
-    /// [Deprecated] Estimate maximum gas via simulation
+    /// Path to save signed transaction, rather than submit it
     ///
-    /// Deprecated parameter, the default behavior is now to estimate max gas automatically, and ask for
-    /// confirmation
-    ///
-    /// This will simulate the transaction, and use the simulated actual amount of gas
-    /// to be used as the max gas.
+    /// If provided, this will sign the transaction and save it locally.  At a later
+    /// time or a different machine, this can be loaded and executed.
     #[clap(long)]
-    pub(crate) estimate_max_gas: bool,
+    pub(crate) signed_transaction_path: Option<PathBuf>,
 
     /// Sender account address
     ///
@@ -1290,7 +1376,7 @@ impl TransactionOptions {
     pub async fn submit_transaction(
         &self,
         payload: TransactionPayload,
-    ) -> CliTypedResult<Transaction> {
+    ) -> CliTypedResult<TransactionOutput> {
         let client = self.rest_client()?;
         let (sender_key, sender_address) = self.get_key_and_address()?;
 
@@ -1375,12 +1461,22 @@ impl TransactionOptions {
         let sender_account = &mut LocalAccount::new(sender_address, sender_key, sequence_number);
         let transaction =
             sender_account.sign_with_transaction_builder(transaction_factory.payload(payload));
-        let response = client
-            .submit_and_wait(&transaction)
-            .await
-            .map_err(|err| CliError::ApiError(err.to_string()))?;
 
-        Ok(response.into_inner())
+        // If we're saving it, save it, otherwise wait for the transaction to complete
+        if let Some(path) = self.signed_transaction_path.as_ref() {
+            self.encoding_options
+                .encoding
+                .encode_file("SignedTransaction", &transaction, path)?;
+            let hash = transaction.committed_hash();
+            Ok(TransactionOutput::SavedTxn(hash.into(), path.to_path_buf()))
+        } else {
+            let response = client
+                .submit_and_wait(&transaction)
+                .await
+                .map_err(|err| CliError::ApiError(err.to_string()))?;
+
+            Ok(TransactionOutput::Txn(response.into_inner()))
+        }
     }
 
     pub async fn simulate_transaction(
@@ -1492,4 +1588,10 @@ pub struct RotationProofChallenge {
     pub originator: AccountAddress,
     pub current_auth_key: AccountAddress,
     pub new_public_key: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum TransactionOutput {
+    Txn(Transaction),
+    SavedTxn(HashValue, PathBuf),
 }
