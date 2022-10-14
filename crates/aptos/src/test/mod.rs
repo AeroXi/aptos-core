@@ -227,6 +227,7 @@ impl CliTestFramework {
                 rest_options: self.rest_options(),
                 gas_options: gas_options.unwrap_or_default(),
                 prompt_options: PromptOptions::yes(),
+                transaction_expiration_secs: 30,
                 ..Default::default()
             },
             new_private_key: Some(new_private_key),
@@ -939,6 +940,7 @@ impl CliTestFramework {
             rest_options: self.rest_options(),
             gas_options: gas_options.unwrap_or_default(),
             prompt_options: PromptOptions::yes(),
+            transaction_expiration_secs: 30,
             ..Default::default()
         }
     }
