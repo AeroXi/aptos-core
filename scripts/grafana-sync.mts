@@ -142,8 +142,8 @@ async function uploadDashboardsToGrafana(localDashboardFolder: string) {
 
 async function uploadDashboard(dashboard: any, grafanaFolderUid: string) {
   dashboard.id = null;
-
-  dashboard.title = dashboard.title;
+  dashboard.uid = dashboard.uid + "-ng";
+  dashboard.title = "x[EXPERIMENTAL] " + dashboard.title;
   const response = await fetch(`${GRAFANA_URL}/api/dashboards/db`, {
     method: "POST",
     headers: commonHeaders,
